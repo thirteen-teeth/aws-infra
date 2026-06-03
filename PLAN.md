@@ -4,6 +4,18 @@ A TypeScript CDK platform that provisions EKS (managed node groups), an S3 bucke
 
 This repository is the **platform**. Application deployments live in their own repositories and consume a small, stable contract (cluster identity, per-tenant namespace + IRSA role + S3 binding, per-tenant deploy role, SSM-published outputs). Feature-branch preview environments are an application-pipeline concern; the platform provides the primitives (namespaces, IRSA, quotas, TTL reaping) that make previews safe and cheap.
 
+## Purpose: observability backend benchmark
+
+The platform's first concrete use case is a head-to-head **cost and query-quality benchmark** of three observability backends fed from the same OpenTelemetry pipeline:
+
+- **ClickHouse** — self-hosted on EKS via the Altinity ClickHouse Operator, using S3 as the primary storage tier (`MergeTree` with the `s3` disk).
+- **OpenSearch** — self-hosted on EKS via the OpenSearch Operator (`opensearch-project/opensearch-k8s-operator`), with EBS gp3 hot tier and S3 snapshot repo.
+- **Datadog** — SaaS; cost computed from the equivalent log/metric/trace volume and cardinality observed at the OpenTelemetry Collector, evaluated against a versioned rate-card.
+
+A single OpenTelemetry Collector receives **CLF-formatted web access logs** (replayed deterministically from a static corpus in S3) converted to **OTLP/OpenTelemetry-formatted messages**, then fans out to three exporters: ClickHouse, OpenSearch, and Datadog. A continuous query benchmark (every minute) runs a fixed query set against ClickHouse and OpenSearch and records latency + bytes scanned. Cost is derived from AWS Cost Explorer cost-allocation tags (ClickHouse, OpenSearch) and a Datadog rate-card calculator (Datadog), all surfaced on a single CloudWatch dashboard and persisted to a `benchmark-results` S3 bucket queryable via Athena.
+
+The benchmark runs in `dev` with per-tenant capacity overrides so stateful targets get on-demand, dedicated nodes; the rest of the env keeps its cheap defaults.
+
 ## Steps
 
 ### Phase 1 — Project scaffolding
@@ -20,7 +32,7 @@ This repository is the **platform**. Application deployments live in their own r
    - Common fields: `name`, `aws: { account, region }`, `tags`, `github: { owner, repo, branches[] }`
    - **Intent-shaped sizing**: `workload: { size: 's'|'m'|'l', capacity: 'spot'|'on-demand' }`. Constructs map intent to instance types in one place, so AWS instance-family changes touch a single file.
    - `capabilities: Capability[]` — typed list (`{ kind: 's3-bucket' }`, future: `{ kind: 'redis', size: 's' }`); the `EksStack` iterates and attaches matching addons. This is the extension seam.
-   - `tenants: Tenant[]` — list of application tenants onboarded to this env. Each tenant declares: `name`, `namespace`, `serviceAccount`, `s3Access: 'rw'|'ro'|'none'`, `github: { owner, repo, branches[] }`. Empty in prod until tenants are added.
+   - `tenants: Tenant[]` — list of application tenants onboarded to this env. Each tenant declares: `name`, `namespace`, `serviceAccount`, `s3Access: 'rw'|'ro'|'none'`, `github: { owner, repo, branches[] }`, optional `capacityOverrides: { capacity?: 'on-demand'|'spot', dedicatedNodeGroup?: boolean, taints?: Taint[] }` for stateful or benchmark workloads, optional `benchmark?: { target: 'clickhouse'|'opensearch'|'datadog', dataset: string }` to opt into the benchmark wiring. Empty in prod until tenants are added.
 7. `config/environments.ts` — frozen map of envs (`dev`, `nonprod`, `prod`) type-checked against the union. Authoring `prod` with `removalPolicy: 'DESTROY'` is a compile error.
 8. `config/index.ts` — `loadEnvConfig(name)` parses with Zod, returns the typed profile, throws structured errors.
 
@@ -113,12 +125,45 @@ This repository owns the platform; apps live in their own repositories. The cont
 51. SNS topic per env (subscriber config out of scope today; topic + policy in code).
 52. New constructs include their alarms as part of the construct's definition.
 
-### Phase 11 — Docs
-53. `README.md`:
+### Phase 11 — Benchmark targets & telemetry pipeline
+The benchmark is composed of five tenants plus shared support; each tenant is just a `Tenant` entry in `dev` that declares its `benchmark` block and its `capacityOverrides`. The constructs below are `PlatformAddon`s registered against new `Capability.kind`s.
+54. **Storage class capability** — `lib/constructs/platform/storage-classes.ts` registers a gp3 `StorageClass` (`platform-gp3`) used by all stateful tenants for parity. Implements `PlatformAddon`.
+55. **Tenant: `loadgen`** — deterministic CLF replay from a static corpus in `s3://<bucket>/loadgen/corpus/`. Stateless `Deployment` with an OTel SDK that emits OTLP logs (with OTel semantic-convention attributes: `service.name`, `http.*`, `client.address`, etc.) at a configurable rate. Read-only S3 access to the corpus prefix. Run-id, target rate, and duration come from a `ConfigMap` written by the platform from the tenant config.
+56. **Tenant: `otel-collector`** — a single Collector deployment (gateway pattern) running the contrib distribution. ConfigMap defines one logs pipeline with three exporters fanning out: `clickhouseexporter` (writes to ClickHouse `otel_logs` schema), `opensearch` exporter (writes to OpenSearch indices), `datadog` exporter (writes to Datadog API). Same batch size, same retry policy, same attribute set across exporters — the Collector config is the experiment definition and is reviewed as code. Exposes its own metrics via `prometheus` exporter on `:8888` for the billing calculator and dashboard.
+57. **Tenant: `clickhouse`** — deployed via Altinity ClickHouse Operator (Helm). `ClickHouseInstallation` CR defines the cluster; `s3` disk uses the platform bucket prefix `s3://<bucket>/clickhouse/<run-id>/`; hot tier on gp3 PVCs. IRSA grants the exact S3 action set ClickHouse needs (`Get/Put/List/DeleteObject`, `*MultipartUpload*`) on its prefix. Schema preloaded by an init Job using the OTel logs schema pinned to the Collector's exporter version. `capacityOverrides`: `on-demand`, `dedicatedNodeGroup`, taint `benchmark=clickhouse:NoSchedule`. Exposes its own ServiceMonitor for the dashboard.
+58. **Tenant: `opensearch`** — deployed via OpenSearch Operator. `OpenSearchCluster` CR defines a small data-node cluster with `platform-gp3` PVCs. IRSA grants S3 access for the snapshot repo (`s3://<bucket>/opensearch/snapshots/`). Static admin credentials in Secrets Manager (out-of-band populated). `capacityOverrides`: `on-demand`, `dedicatedNodeGroup`, taint `benchmark=opensearch:NoSchedule`.
+59. **Tenant: `query-bench`** — a `Deployment` (continuous, one query per minute per backend) running a small TypeScript service that holds the canonical query set:
+    - "Last 1h logs where `http.response.status_code` >= 500"
+    - "p99 latency by `service.name` over 24h"
+    - "Top 10 `user_agent.original` by request count, last 7d"
+    Each query is expressed in three dialects (ClickHouse SQL, OpenSearch DSL, Datadog Logs Search) and run against each backend. Records `latency_ms`, `bytes_scanned` (where exposed), `result_row_count`, and a result-fingerprint for parity checking. Writes one row per execution to `s3://<benchmark-results-bucket>/query-bench/<run-id>/` as Parquet.
+60. **Cost-allocation tagging invariant** — every taggable resource created for a benchmark tenant carries `benchmark=true`, `target=<clickhouse|opensearch|datadog>`, `run-id=<uuid>`. Enforced by an aspect in `lib/constructs/benchmark/tagging-aspect.ts` and asserted by `test/benchmark-tagging.test.ts`.
+61. **Renovate group `benchmark-pinned`** for the OTel Collector contrib image, ClickHouse exporter schema version, OpenSearch operator + image, Altinity operator + ClickHouse image. Manual approval only (no auto-merge) since version bumps invalidate prior runs.
+
+### Phase 12 — Cost & query-quality measurement
+62. **`lib/constructs/benchmark/billing-calculator.ts`** — a Lambda + EventBridge schedule (every minute) that scrapes the OTel Collector's Prometheus endpoint via the cluster (over a private LB or in-cluster CronJob proxying out), reads the logs/traces/metrics ingestion counters per exporter, and emits CloudWatch custom metrics under namespace `Platform/Benchmark`:
+    - `ClickHouse/BytesIngested`, `OpenSearch/BytesIngested`, `Datadog/BytesIngested`
+    - `Datadog/MetricCardinalityActive` (computed from unique `(metric_name, attribute_set)` tuples observed)
+    - `Datadog/EquivalentCostPerMin` (logs GB × ingest rate + indexed events × indexed rate + custom metrics × cardinality rate, from `config/datadog-rate-card.json`)
+63. **`config/datadog-rate-card.json`** — hand-maintained, checked into the repo, reviewed via PR. Fields: `logs_ingested_usd_per_gb`, `logs_indexed_usd_per_million`, `metrics_custom_usd_per_metric_per_host_per_month`, `traces_ingested_usd_per_gb`, `traces_indexed_usd_per_million`. Documented source URL and capture date in a sibling `.md`.
+64. **`lib/stacks/benchmark-results-stack.ts`** — separate stack with: a dedicated `benchmark-results` S3 bucket (versioned, RETAIN, no autoDelete — these are the experimental record); a Glue database `benchmark`; Glue tables `query_bench`, `cost_minutely`; an Athena workgroup `benchmark` with result location set to a workgroup-only prefix. Tagged `benchmark=true`.
+65. **`lib/constructs/benchmark/dashboard-construct.ts`** — a CloudWatch dashboard that puts side-by-side:
+    - $ / GB ingested per backend (AWS-derived for CH/OS via Cost Explorer + tags; Datadog from the calculator)
+    - $ / GB stored per backend
+    - p50/p95/p99 query latency per backend per query (from `query-bench`)
+    - bytes scanned per query per backend (where reported)
+    - storage growth on the ClickHouse S3 prefix (S3 Storage Lens) and OpenSearch EBS volumes
+    - OTel Collector exporter queue depth + retry rates per exporter (parity check)
+66. **Run lifecycle** — a `run-id` is a UUID + RFC3339 timestamp + dataset name. The platform writes the active `run-id` to `/platform/<env>/benchmark/run-id` via a small `npm run benchmark:start` script that also stamps the resource tags via an aspect. `npm run benchmark:stop` clears the parameter and snapshots the dashboard to PNG into `benchmark-results`. Each `run-id` is written to a separate prefix under both the data buckets and the results bucket so individual runs are isolatable and deletable. **Cleanup of an old run** is a dedicated `scripts/benchmark-cleanup.ts` that, given a `run-id`, drops the ClickHouse prefix, deletes the OpenSearch indices for that run, and deletes the Datadog logs via API; the targets themselves remain.
+67. **Quality gate** — `query-bench` records a result fingerprint per query (sorted hash of result rows). A nightly job compares fingerprints across backends; mismatches open a GitHub issue. Cost without parity is meaningless; parity failures invalidate the run.
+
+### Phase 13 — Docs
+68. `README.md`:
     - **Architecture** — short diagram of stacks, capabilities, tenants, extension contract.
     - **Quickstart**: `cp .envrc.example .envrc && direnv allow` → `npm run setup` → `npm run deploy:bootstrap` (one-time, local creds) → set GH var `AWS_DEPLOY_ROLE_ARN_DEV` → push.
     - **Onboarding a tenant** — add an entry to `tenants[]`, open PR, review the `cdk diff`, merge; SSM parameters become available for the app pipeline.
     - **App-side integration guide** — how an application repo reads SSM, assumes its deploy role, and runs feature-branch previews (template GitHub workflow snippet).
+    - **Benchmark playbook** — starting/stopping a run, interpreting the dashboard, updating `datadog-rate-card.json`, cleaning up a run-id, parity-failure triage.
     - **How to add a capability** — implement `PlatformAddon`, add a `Capability` variant, register factory, write tests.
     - **Operating playbook** — common workflows, drift response, rollback, incident links.
     - **Versioning** — the `Tenant` config shape and SSM contract are the platform's public API; breaking changes require a changeset entry.
@@ -133,8 +178,12 @@ This repository owns the platform; apps live in their own repositories. The cont
 - `lib/constructs/cleanup/k8s-loadbalancer-cleanup.ts` (+ Lambda handler under `cleanup/handler/`)
 - `lib/constructs/pipeline/github-oidc-construct.ts`
 - `lib/observability/platform-alarms.ts`
-- `lib/stacks/{bootstrap,network,storage,eks,tenants}-stack.ts`
-- `test/{config,storage-stack,eks-stack,tenants-stack,github-oidc,cleanup-handler,contract}.test.ts` + `test/snapshots/`
+- `lib/stacks/{bootstrap,network,storage,eks,tenants,benchmark-results}-stack.ts`
+- `lib/constructs/benchmark/{billing-calculator,dashboard-construct,tagging-aspect}.ts` (+ Lambda handler under `benchmark/handler/`)
+- `lib/constructs/platform/storage-classes.ts`
+- `config/datadog-rate-card.json` (+ sibling `datadog-rate-card.md` with source URL and capture date)
+- `scripts/benchmark-cleanup.ts`
+- `test/{config,storage-stack,eks-stack,tenants-stack,github-oidc,cleanup-handler,contract,benchmark-tagging}.test.ts` + `test/snapshots/`
 - `integ/` (manual-trigger integ tests)
 - `.github/workflows/{pr,deploy,drift}.yml`
 - `package.json`, `tsconfig.json`, `cdk.json`, `.nvmrc`, `.envrc.example`, `.gitignore`, `README.md`, `CODEOWNERS`, `renovate.json`
@@ -153,6 +202,9 @@ This repository owns the platform; apps live in their own repositories. The cont
 10. Drift workflow against an out-of-band change opens an issue within 24h.
 11. Type test: authoring a `prod` env entry with `removalPolicy: 'DESTROY'` fails `tsc`.
 12. `NamespaceReaper`: a namespace labeled `platform.example.com/ttl` in the past is deleted within the CronJob's interval.
+13. **Benchmark tagging invariant**: `npm test` fails if any taggable resource produced by a benchmark tenant is missing `benchmark`, `target`, or `run-id` tags.
+14. **End-to-end benchmark smoke** (manual): `npm run benchmark:start` → `loadgen` replays the corpus → within 5 minutes, `Platform/Benchmark/*/BytesIngested` is non-zero for all three exporters and `query-bench` results land in the `benchmark-results` bucket queryable from Athena.
+15. **Parity check**: result fingerprints for the canonical query set match between ClickHouse and OpenSearch (Datadog excluded where its query language can't express the exact predicate); a deliberate fingerprint mismatch opens an issue.
 
 ## Decisions
 - **Platform vs application split**: this repo is the platform; application deploys live in app repos. The seam is a small SSM-published contract plus per-tenant IAM roles.
@@ -168,7 +220,11 @@ This repository owns the platform; apps live in their own repositories. The cont
 - **OIDC trust** is covered by tests so trust-policy regressions are caught at PR time.
 - **Stack split** (`Bootstrap`/`Network`/`Storage`/`Eks`/`Tenants`) gives blast-radius isolation and per-stack teardown.
 - **Account topology**: each env carries its own `aws.account`/`aws.region`; the same model works for single- or multi-account.
-- **Out of scope today**: deploying nonprod/prod, the application repositories themselves, RDS, custom domain/ACM, CDK Pipelines, leased dev-cluster pool for platform-change previews.
+- **Benchmark targets are tenants**: ClickHouse, OpenSearch, the OTel Collector, the load generator, and the query bench are all just `Tenant` entries with `capacityOverrides` and a `benchmark` block. Nothing special-cased in the cluster.
+- **One Collector, three exporters**: a single OTel Collector pipeline fans out to ClickHouse, OpenSearch, and Datadog so the input-side variables (batch size, attribute set, retries) are identical across backends. The Collector config is the experiment definition.
+- **Datadog cost is calculated, not measured**: a hand-maintained `datadog-rate-card.json` is multiplied by Collector-observed volumes and cardinality. The rate card is reviewed in PRs; runs note the rate-card commit hash.
+- **Run isolation**: every run gets a UUID `run-id` tag and prefix; data buckets, results bucket, and Datadog log indices partition on it. Cleanup deletes data per run, not per target.
+- **Out of scope today**: deploying nonprod/prod, the application repositories themselves, RDS, custom domain/ACM, CDK Pipelines, leased dev-cluster pool for platform-change previews, multi-region benchmark replication, ingest-side fairness across non-OTel-native protocols (Datadog Agent, Beats), Datadog APM trace ingestion (logs first — traces and metrics are a follow-up).
 
 ## Further considerations
 1. **Deploy role permissions**: start Admin scoped by `aws:RequestedRegion`, then tighten using CloudTrail-derived least-privilege after first stable deploy.
@@ -177,3 +233,6 @@ This repository owns the platform; apps live in their own repositories. The cont
 4. **Upgrade obligations**: Renovate handles CDK/Action versions; K8s minor-version bumps are quarterly maintenance with a documented runbook.
 5. **Public-API discipline**: the `Tenant` shape and the SSM parameter contract are consumed by application repositories; breaking changes require a changeset entry and a deprecation window.
 6. **Platform-change previews**: today, platform changes are validated by tests + manual integ runs; if pain emerges, add a leased pool of pre-warmed dev clusters as a follow-up.
+7. **Benchmark fairness**: results are only meaningful at iso-input (same Collector, same dataset, same attributes). Cross-backend comparisons should always cite the `run-id` and the rate-card commit. A future improvement is replaying multiple datasets (CLF today; structured JSON logs and trace data next) so cost ratios aren't an artifact of one workload.
+8. **Datadog egress costs**: Collector → Datadog traffic crosses the NAT gateway. Tag the NAT data-processing line items so the Datadog-side cost includes egress, not only the rate-card.
+9. **OpenSearch storage tiering**: today gp3 hot only. UltraWarm/cold-via-S3-snapshot is a follow-up that would materially change the OpenSearch storage cost line and should be a separate run-id, not retrofitted.
